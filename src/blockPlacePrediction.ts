@@ -94,14 +94,8 @@ export const botTryPlaceBlockPrediction = (bot: Bot, cursorBlock: Block, faceNum
                 doUpdate()
             }
         }
-        return true
     }
-    // Held item doesn't map to any real block (e.g. iron ingot, tools, food, empty hand
-    // reaching this point via sneak) - nothing was actually placed, so this must NOT be
-    // reported as a successful prediction. Previously this fell through to `return true`
-    // unconditionally, which caused a spurious 'mouseBlockPlaced' event on plain right-click
-    // interactions (Stone, Crafting Table, etc.) even though setBlockStateId was never called.
-    return false
+    return true
 }
 
 export const isBlockIntersectsWithEntities = (entities: Bot['entities'], position: Vec3, blockShapes: Shape[]) => {
