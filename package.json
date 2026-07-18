@@ -10,7 +10,6 @@
     "scripts": {
         "watch": "tsc --watch",
         "build": "tsc",
-        "prepare": "tsc",
         "test": "vitest"
     },
     "keywords": [
