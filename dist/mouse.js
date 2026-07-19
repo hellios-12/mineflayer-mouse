@@ -1,0 +1,747 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.MousePlugin = exports.versionToNumber = exports.MouseManager = void 0;
+exports.inject = inject;
+const vec3_1 = require("vec3");
+const prismarine_item_1 = __importDefault(require("prismarine-item"));
+const debug_1 = require("./debug");
+const entityRaycast_1 = require("./entityRaycast");
+const blockPlacePrediction_1 = require("./blockPlacePrediction");
+const itemActivatable_1 = require("./itemActivatable");
+const itemBlocksStatic_1 = require("./itemBlocksStatic");
+const minecraft_data_1 = __importDefault(require("minecraft-data"));
+const defaultBlockHandlers = {
+    bed: {
+        test: (block) => block.name === 'bed' || block.name.endsWith('_bed'),
+        handle: async (block, bot) => {
+            bot.emit('goingToSleep', block);
+            await bot.sleep(block);
+        }
+    }
+};
+// The delay is always 5 ticks between blocks
+// https://github.com/extremeheat/extracted_minecraft_data/blob/158aff8ad2a9051505e05703f554af8e50741d69/client/net/minecraft/client/multiplayer/MultiPlayerGameMode.java#L200
+const BLOCK_BREAK_DELAY_TICKS = 5;
+/**
+ * Checks if an entity is a vehicle (minecart or boat) that could cause the bot to get stuck
+ * @param entity The entity to check
+ * @returns true if the entity is a minecart or boat
+ */
+function isProblematicVehicleEntity(entity) {
+    if (!entity.name)
+        return false;
+    const name = entity.name.toLowerCase();
+    return name === 'minecart' || name.includes('boat');
+}
+/** Matches anvil / chipped_anvil / damaged_anvil block ids */
+const matchAnvilBlockType = (type) => /minecraft:(?:chipped_|damaged_)?anvil/.test(type);
+const matchEnchantmentTableBlockType = (type) => type.startsWith('minecraft:enchant');
+function blockTypeId(block) {
+    return block.name.includes(':') ? block.name : `minecraft:${block.name}`;
+}
+/** True if item is a block that exists in the registry (placeable block item) */
+function isPlaceableBlockItem(bot, item) {
+    if (!item)
+        return false;
+    try {
+        return (0, minecraft_data_1.default)(bot.version).blocksByName[item.name] !== undefined;
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * Use openAnvil / openEnchantmentTable instead of block_place when not trying to place on the block:
+ * vanilla: sneak + block in hand places on the block; otherwise open GUI.
+ */
+function shouldOpenBlockGuiInsteadOfPlacePackets(bot) {
+    const sneak = bot.getControlState('sneak');
+    const mainBlock = isPlaceableBlockItem(bot, bot.heldItem);
+    const offBlock = bot.supportFeature('doesntHaveOffHandSlot') ? false : isPlaceableBlockItem(bot, bot.inventory.slots[45]);
+    return !sneak || (!mainBlock && !offBlock);
+}
+function isVillagerForTrade(entity) {
+    const n = entity.name?.toLowerCase();
+    return n === 'villager' || n === 'zombie_villager';
+}
+/** True if feet or head are in water / bubble column (typical swimming case when `onGround` is false). */
+function isEntityInWater(bot) {
+    return bot.entity?.['isInWater'];
+}
+/** Whether vanilla-like mining may start: on ground, in water while airborne, or mid-air when setting allows. */
+function canStartBreakMining(bot, onGround, allowInAirMining) {
+    if (onGround)
+        return true;
+    if (allowInAirMining === true)
+        return true;
+    if (isEntityInWater(bot) && !onGround)
+        return true;
+    return false;
+}
+class MouseManager {
+    bot;
+    settings;
+    /** stateId - seconds */
+    customBreakTime = {};
+    customBreakTimeToolAllowance = new Set();
+    buttons = [false, false, false];
+    lastButtons = [false, false, false];
+    cursorBlock = null;
+    tick = 0;
+    entityRaycastCache = null;
+    prevBreakState = null;
+    currentDigTime = null;
+    prevOnGround = null;
+    rightClickDelay = 4;
+    breakStartTime = undefined;
+    ended = false;
+    lastDugBlock = null;
+    lastDugTime = 0;
+    /** a visually synced one */
+    currentBreakBlock = null;
+    debugDigStatus = 'none';
+    debugLastStopReason = 'none';
+    brokenBlocks = [];
+    lastSwing = 0;
+    itemBeingUsed = null;
+    swingTimeout = null;
+    // todo clear when got a packet from server
+    blockHandlers;
+    originalDigTime;
+    constructor(bot, settings = {}) {
+        this.bot = bot;
+        this.settings = settings;
+        this.blockHandlers = {
+            ...defaultBlockHandlers,
+            ...(settings.blockInteractionHandlers ?? {})
+        };
+        this.initBotEvents();
+        // patch mineflayer
+        this.originalDigTime = bot.digTime;
+        bot.digTime = this.digTime.bind(this);
+    }
+    resetDiggingVisual(block) {
+        this.bot.emit('blockBreakProgressStage', block, null);
+        this.currentBreakBlock = null;
+        this.prevBreakState = null;
+    }
+    stopDiggingCompletely(reason, tempStopping = false) {
+        // try { this.bot.stopDigging() } catch (err) { console.warn('stopDiggingCompletely', err) }
+        try {
+            this.bot.stopDigging();
+        }
+        catch (err) { }
+        this.breakStartTime = undefined;
+        if (this.currentBreakBlock) {
+            this.resetDiggingVisual(this.currentBreakBlock.block);
+        }
+        this.debugDigStatus = `stopped by ${reason}`;
+        this.debugLastStopReason = reason;
+        this.currentDigTime = null;
+        if (!tempStopping) {
+            this.bot.emit('botArmSwingEnd', 'right');
+        }
+    }
+    initBotEvents() {
+        this.bot.on('physicsTick', () => {
+            this.tick++;
+            if (this.rightClickDelay < 4)
+                this.rightClickDelay++;
+            this.update();
+        });
+        this.bot.on('end', () => {
+            this.ended = true;
+        });
+        this.bot.on('diggingCompleted', (block) => {
+            this.breakStartTime = undefined;
+            this.lastDugBlock = block.position;
+            this.lastDugTime = Date.now();
+            this.debugDigStatus = 'success';
+            this.brokenBlocks = [...this.brokenBlocks.slice(-5), block];
+            this.resetDiggingVisual(block);
+            // TODO: If the tool and enchantments immediately exceed the hardness times 30, the block breaks with no delay; SO WE NEED TO CHECK THAT
+            // TODO: Any blocks with a breaking time of 0.05
+        });
+        this.bot.on('diggingAborted', (block) => {
+            if (!this.cursorBlock?.position.equals(block.position))
+                return;
+            this.debugDigStatus = 'aborted';
+            this.breakStartTime = undefined;
+            if (this.buttons[0]) {
+                this.buttons[0] = false;
+                this.update();
+                this.buttons[0] = true; // trigger again
+            }
+            this.lastDugBlock = null;
+            this.resetDiggingVisual(block);
+        });
+        this.bot.on('entitySwingArm', (entity) => {
+            if (this.bot.entity && entity.id === this.bot.entity.id) {
+                if (this.swingTimeout) {
+                    clearTimeout(this.swingTimeout);
+                }
+                this.bot.swingArm('right');
+                this.bot.emit('botArmSwingStart', 'right');
+                this.swingTimeout = setTimeout(() => {
+                    if (this.ended)
+                        return;
+                    this.bot.emit('botArmSwingEnd', 'right');
+                    this.swingTimeout = null;
+                }, 250);
+            }
+        });
+        //@ts-ignore
+        this.bot.on('blockBreakProgressStageObserved', (block, destroyStage, entity) => {
+            if (this.bot.entity && this.cursorBlock?.position.equals(block.position) && entity.id === this.bot.entity.id) {
+                if (!this.buttons[0]) {
+                    this.buttons[0] = true;
+                    this.update();
+                }
+            }
+        });
+        //@ts-ignore
+        this.bot.on('blockBreakProgressStageEnd', (block, entity) => {
+            if (this.bot.entity && this.currentBreakBlock?.block.position.equals(block.position) && entity.id === this.bot.entity.id) {
+                if (!this.buttons[0]) {
+                    this.buttons[0] = false;
+                    this.update();
+                }
+            }
+        });
+        this.bot._client.on('acknowledge_player_digging', (data) => {
+            if ('location' in data && !data.successful) {
+                const packetPos = new vec3_1.Vec3(data.location.x, data.location.y, data.location.z);
+                if (this.cursorBlock?.position.equals(packetPos)) {
+                    // restore the block to the world if already digged
+                    if (this.bot.world.getBlockStateId(packetPos) === 0) {
+                        const block = this.brokenBlocks.find(b => b.position.equals(packetPos));
+                        if (block) {
+                            this.bot.world.setBlock(packetPos, block);
+                        }
+                        else {
+                            (0, debug_1.debug)(`Cannot find block to restore at ${packetPos}`);
+                        }
+                    }
+                    this.buttons[0] = false;
+                    this.update();
+                }
+            }
+        });
+        this.bot.on('heldItemChanged', () => {
+            if (this.itemBeingUsed && !this.itemBeingUsed.isOffhand) {
+                this.stopUsingItem();
+            }
+        });
+    }
+    activateEntity(entity) {
+        this.bot.emit('botArmSwingStart', 'right');
+        this.bot.emit('botArmSwingEnd', 'right');
+        // mineflayer has completely wrong implementation of this action
+        if (this.bot.supportFeature('armAnimationBeforeUse')) {
+            this.bot.swingArm('right');
+        }
+        this.bot._client.write('use_entity', {
+            target: entity.id,
+            mouse: 2,
+            // todo do not fake
+            x: 0.581_012_585_759_162_9,
+            y: 0.581_012_585_759_162_9,
+            z: 0.581_012_585_759_162_9,
+            sneaking: this.bot.getControlState('sneak'),
+            hand: 0
+        });
+        this.bot._client.write('use_entity', {
+            target: entity.id,
+            mouse: 0,
+            sneaking: this.bot.getControlState('sneak'),
+            hand: 0
+        });
+        if (!this.bot.supportFeature('armAnimationBeforeUse')) {
+            this.bot.swingArm('right');
+        }
+    }
+    beforeUpdateChecks() { }
+    update() {
+        this.beforeUpdateChecks();
+        const { cursorBlock, cursorBlockDiggable, cursorChanged, cursorPositionChanged, entity } = this.getCursorState();
+        // Handle item deactivation
+        if (this.itemBeingUsed && !this.buttons[2]) {
+            this.stopUsingItem();
+        }
+        // Handle entity interactions
+        if (entity) {
+            if (this.buttons[0] && !this.lastButtons[0]) {
+                // Left click - attack
+                this.bot.emit('botArmSwingStart', 'right');
+                this.bot.emit('botArmSwingEnd', 'right');
+                this.bot.attack(entity); // already swings to servers
+            }
+            else if (this.buttons[2] && !this.lastButtons[2]) {
+                // Right click - interact
+                if (isVillagerForTrade(entity) && typeof this.bot.openVillager === 'function' && this.settings.useMineflayerInteractMethods !== false) {
+                    void this.bot.openVillager(entity).catch((err) => this.bot.emit('error', err instanceof Error ? err : new Error(String(err))));
+                }
+                else {
+                    // Prevent activation of vehicles (minecarts/boats) to avoid getting stuck
+                    const preventVehicle = this.settings.preventVehicleInteraction !== false;
+                    if (preventVehicle && isProblematicVehicleEntity(entity)) {
+                        // Skip activation with vehicles to prevent getting stuck inside them
+                        // which could cause server kick for flying
+                        console.warn(`Prevented vehicle interaction with ${entity.name} to avoid getting stuck because of Mineflayer bug`);
+                    }
+                    else {
+                        this.activateEntity(entity);
+                    }
+                }
+            }
+        }
+        else {
+            if (this.buttons[2] && (this.rightClickDelay >= 4 || !this.lastButtons[2])) {
+                this.updatePlaceInteract(cursorBlock);
+            }
+            this.updateBreaking(cursorBlock, cursorBlockDiggable, cursorChanged, cursorPositionChanged);
+        }
+        this.updateButtonStates();
+    }
+    getCursorState() {
+        const inSpectator = this.bot.game.gameMode === 'spectator';
+        const inAdventure = this.bot.game.gameMode === 'adventure';
+        const entity = this.getCachedRaycastEntity();
+        // If entity is found, we should stop any current digging
+        let cursorBlock = this.bot.entity ? this.bot.blockAtCursor(5) : null;
+        if (entity) {
+            cursorBlock = null;
+            if (this.breakStartTime !== undefined) {
+                this.stopDiggingCompletely('entity interference');
+            }
+        }
+        let cursorBlockDiggable = cursorBlock;
+        if (cursorBlock && (!this.bot.canDigBlock(cursorBlock) || inAdventure) && this.bot.game.gameMode !== 'creative') {
+            cursorBlockDiggable = null;
+        }
+        let cursorChanged = this.cursorBlock !== cursorBlock;
+        let cursorPositionChanged = false;
+        if (cursorBlock && this.cursorBlock) {
+            const samePos = this.cursorBlock.position.equals(cursorBlock.position);
+            const sameState = this.cursorBlock.stateId === cursorBlock.stateId;
+            cursorChanged = !(samePos && sameState);
+            cursorPositionChanged = !samePos;
+        }
+        else {
+            cursorPositionChanged = cursorChanged;
+        }
+        if (cursorChanged) {
+            this.bot.emit('highlightCursorBlock', cursorBlock ? { block: cursorBlock } : undefined);
+        }
+        this.cursorBlock = cursorBlock;
+        return { cursorBlock, cursorBlockDiggable, cursorChanged, cursorPositionChanged, entity };
+    }
+    getCachedRaycastEntity() {
+        if (!this.bot.entity)
+            return null;
+        if (this.entityRaycastCache?.tick === this.tick) {
+            return this.entityRaycastCache.entity;
+        }
+        const entity = (0, entityRaycast_1.raycastEntity)(this.bot);
+        this.entityRaycastCache = { tick: this.tick, entity };
+        return entity;
+    }
+    async placeBlock(cursorBlock, direction, delta, offhand, forceLook = 'ignore', doClientSwing = true) {
+        const handToPlaceWith = offhand ? 1 : 0;
+        if (offhand && this.bot.supportFeature('doesntHaveOffHandSlot')) {
+            return;
+        }
+        let dx = 0.5 + direction.x * 0.5;
+        let dy = 0.5 + direction.y * 0.5;
+        let dz = 0.5 + direction.z * 0.5;
+        if (delta) {
+            dx = delta.x;
+            dy = delta.y;
+            dz = delta.z;
+        }
+        if (forceLook !== 'ignore') {
+            await this.bot.lookAt(cursorBlock.position.offset(dx, dy, dz), forceLook === 'lookAtForce');
+        }
+        const pos = cursorBlock.position;
+        const Item = (0, prismarine_item_1.default)(this.bot.version);
+        const { bot } = this;
+        if (bot.supportFeature('blockPlaceHasHeldItem')) {
+            const packet = {
+                location: pos,
+                direction: vectorToDirection(direction),
+                heldItem: Item.toNotch(bot.heldItem),
+                cursorX: Math.floor(dx * 16),
+                cursorY: Math.floor(dy * 16),
+                cursorZ: Math.floor(dz * 16)
+            };
+            bot._client.write('block_place', packet);
+        }
+        else if (bot.supportFeature('blockPlaceHasHandAndIntCursor')) {
+            bot._client.write('block_place', {
+                location: pos,
+                direction: vectorToDirection(direction),
+                hand: handToPlaceWith,
+                cursorX: Math.floor(dx * 16),
+                cursorY: Math.floor(dy * 16),
+                cursorZ: Math.floor(dz * 16)
+            });
+        }
+        else if (bot.supportFeature('blockPlaceHasHandAndFloatCursor')) {
+            bot._client.write('block_place', {
+                location: pos,
+                direction: vectorToDirection(direction),
+                hand: handToPlaceWith,
+                cursorX: dx,
+                cursorY: dy,
+                cursorZ: dz
+            });
+        }
+        else if (bot.supportFeature('blockPlaceHasInsideBlock')) {
+            bot._client.write('block_place', {
+                location: pos,
+                direction: vectorToDirection(direction),
+                hand: handToPlaceWith,
+                cursorX: dx,
+                cursorY: dy,
+                cursorZ: dz,
+                insideBlock: false,
+                sequence: 0, // 1.19.0
+                worldBorderHit: false // 1.21.3
+            });
+        }
+        if (!offhand) {
+            this.bot.swingArm(offhand ? 'left' : 'right');
+        }
+        if (doClientSwing) {
+            this.bot.emit('botArmSwingStart', offhand ? 'left' : 'right');
+            this.bot.emit('botArmSwingEnd', offhand ? 'left' : 'right');
+        }
+    }
+    updatePlaceInteract(cursorBlock) {
+        if (cursorBlock && shouldOpenBlockGuiInsteadOfPlacePackets(this.bot) && this.settings.useMineflayerInteractMethods !== false) {
+            const typeId = blockTypeId(cursorBlock);
+            if (matchAnvilBlockType(typeId) && typeof this.bot.openAnvil === 'function') {
+                void this.bot.openAnvil(cursorBlock).catch((err) => this.bot.emit('error', err instanceof Error ? err : new Error(String(err))));
+                this.rightClickDelay = 0;
+                return;
+            }
+            if (matchEnchantmentTableBlockType(typeId) && typeof this.bot.openEnchantmentTable === 'function') {
+                void this.bot.openEnchantmentTable(cursorBlock).catch((err) => this.bot.emit('error', err instanceof Error ? err : new Error(String(err))));
+                this.rightClickDelay = 0;
+                return;
+            }
+        }
+        // Check for special block handlers first
+        let handled = false;
+        if (!this.bot.getControlState('sneak') && cursorBlock) {
+            for (const handler of Object.values(this.blockHandlers)) {
+                if (handler.test(cursorBlock)) {
+                    try {
+                        handler.handle(cursorBlock, this.bot);
+                        handled = true;
+                        break;
+                    }
+                    catch (err) {
+                        this.bot.emit('error', err);
+                    }
+                }
+            }
+        }
+        const activateMain = this.bot.heldItem && (0, itemActivatable_1.isItemActivatable)(this.bot.version, this.bot.heldItem);
+        const offHandItem = this.bot.inventory.slots[45];
+        if (!handled) {
+            let possiblyPlaceOffhand = () => { };
+            if (cursorBlock) {
+                const delta = cursorBlock['intersect'].minus(cursorBlock.position);
+                const faceNum = cursorBlock['face'];
+                const direction = blockPlacePrediction_1.directionToVector[faceNum];
+                // TODO support offhand prediction
+                const blockPlacementPredicted = (0, blockPlacePrediction_1.botTryPlaceBlockPrediction)(this.bot, cursorBlock, faceNum, delta, this.settings.blockPlacePrediction ?? true, this.settings.blockPlacePredictionDelay ?? 0, this.settings.blockPlacePredictionHandler ?? null, this.settings.blockPlacePredictionCheckEntities ?? true);
+                if (blockPlacementPredicted) {
+                    this.bot.emit('mouseBlockPlaced', cursorBlock, direction, delta, false, true);
+                }
+                // always emit block_place when looking at block
+                this.placeBlock(cursorBlock, direction, delta, false, undefined, !activateMain);
+                // Vanilla: offhand block_place only when block is not activatable, or when sneaking (item use takes priority)
+                const blockActivatable = (0, itemBlocksStatic_1.isBlockActivatable)(cursorBlock.name);
+                const shouldPlaceOffhand = !blockActivatable || this.bot.getControlState('sneak');
+                if (!this.bot.supportFeature('doesntHaveOffHandSlot') && shouldPlaceOffhand) {
+                    possiblyPlaceOffhand = () => {
+                        this.placeBlock(cursorBlock, direction, delta, true, undefined, false);
+                    };
+                }
+            }
+            if (activateMain || !cursorBlock) {
+                const offhand = activateMain ? false : (0, itemActivatable_1.isItemActivatable)(this.bot.version, offHandItem);
+                const item = offhand ? offHandItem : this.bot.heldItem;
+                if (item) {
+                    this.startUsingItem(item, offhand);
+                }
+            }
+            possiblyPlaceOffhand();
+        }
+        this.rightClickDelay = 0;
+    }
+    getCustomBreakTime(block) {
+        if (this.customBreakTimeToolAllowance.size) {
+            const heldItemId = this.bot.heldItem?.name;
+            if (!this.customBreakTimeToolAllowance.has(heldItemId ?? '')) {
+                return undefined;
+            }
+        }
+        return this.customBreakTime[block.stateId] ?? this.customBreakTime[block.name] ?? this.customBreakTime['*'];
+    }
+    digTime(block) {
+        const customTime = this.getCustomBreakTime(block);
+        if (customTime !== undefined)
+            return customTime * 1000;
+        const time = this.originalDigTime(block);
+        if (!time)
+            return time;
+        return time;
+    }
+    startUsingItem(item, isOffhand) {
+        if (this.itemBeingUsed)
+            return; // hands busy
+        if (isOffhand && this.bot.supportFeature('doesntHaveOffHandSlot'))
+            return;
+        const slot = isOffhand ? 45 : this.bot.quickBarSlot;
+        this.bot.activateItem(isOffhand);
+        this.itemBeingUsed = {
+            item,
+            isOffhand,
+            name: item.name
+        };
+        this.bot.emit('startUsingItem', item, slot, isOffhand, -1);
+    }
+    // TODO use it when item cant be used (define another map)
+    // useItemOnce(item: { name: string }, isOffhand: boolean) {
+    // }
+    stopUsingItem() {
+        if (this.itemBeingUsed) {
+            const { isOffhand, item } = this.itemBeingUsed;
+            const slot = isOffhand ? 45 : this.bot.quickBarSlot;
+            this.bot.emit('stopUsingItem', item, slot, isOffhand);
+            this.bot.deactivateItem();
+            this.itemBeingUsed = null;
+        }
+    }
+    updateBreaking(cursorBlock, cursorBlockDiggable, cursorChanged, cursorPositionChanged) {
+        // Only stop when block position changed - stateId-only changes (server sync) can cause spurious stops and stuck state
+        if (cursorPositionChanged) {
+            this.stopDiggingCompletely('block change delay', !!cursorBlockDiggable);
+        }
+        // We stopped breaking
+        if (!this.buttons[0] && this.lastButtons[0]) {
+            this.stopDiggingCompletely('user stopped');
+        }
+        const hasCustomBreakTime = cursorBlockDiggable ? this.getCustomBreakTime(cursorBlockDiggable) !== undefined : false;
+        const onGround = this.bot.entity?.onGround || this.bot.game.gameMode === 'creative' || hasCustomBreakTime;
+        const canStartBreak = canStartBreakMining(this.bot, onGround, this.settings.allowInAirMining);
+        this.prevOnGround ??= onGround; // todo this should be fixed in mineflayer to involve correct calculations when this changes as this is very important when mining straight down
+        this.updateBreakingBlockState(cursorBlockDiggable);
+        // Start break
+        if (this.buttons[0]) {
+            this.maybeStartBreaking(cursorBlock, cursorBlockDiggable, cursorChanged, cursorPositionChanged, canStartBreak, onGround);
+        }
+        this.prevOnGround = onGround;
+    }
+    updateBreakingBlockState(cursorBlockDiggable) {
+        // Calculate and emit break progress
+        if (cursorBlockDiggable && this.breakStartTime !== undefined && this.bot.game.gameMode !== 'creative') {
+            const elapsed = performance.now() - this.breakStartTime;
+            const time = this.digTime(cursorBlockDiggable);
+            if (time !== this.currentDigTime) {
+                console.warn('dig time changed! cancelling!', this.currentDigTime, '->', time);
+                this.stopDiggingCompletely('dig time changed');
+            }
+            else {
+                const state = Math.floor((elapsed / time) * 10);
+                if (state !== this.prevBreakState) {
+                    this.bot.emit('blockBreakProgressStage', cursorBlockDiggable, Math.min(state, 9));
+                    this.currentBreakBlock = { block: cursorBlockDiggable, stage: state };
+                }
+                this.prevBreakState = state;
+            }
+        }
+    }
+    maybeStartBreaking(cursorBlock, cursorBlockDiggable, cursorChanged, cursorPositionChanged, canStartBreak, onGround) {
+        const justStartingNewBreak = !this.lastButtons[0];
+        // Allow resume when stopped and still on a diggable block (e.g. server restored block at same position)
+        const stoppedWithBlock = this.breakStartTime === undefined && !!cursorBlockDiggable;
+        const blockChanged = cursorPositionChanged || (this.lastDugBlock && cursorBlock && !this.lastDugBlock.equals(cursorBlock.position)) || stoppedWithBlock;
+        const diggingCompletedEnoughTimePassed = !this.lastDugTime || (Date.now() - this.lastDugTime > BLOCK_BREAK_DELAY_TICKS * 1000 / 20);
+        const hasCustomBreakTime = cursorBlockDiggable && this.getCustomBreakTime(cursorBlockDiggable) !== undefined;
+        const breakStartConditionsChanged = onGround !== this.prevOnGround && !this.currentBreakBlock;
+        if (cursorBlockDiggable) {
+            if (canStartBreak
+                && (justStartingNewBreak || (diggingCompletedEnoughTimePassed && (blockChanged || breakStartConditionsChanged)))) {
+                this.startBreaking(cursorBlockDiggable);
+            }
+        }
+        else if (performance.now() - this.lastSwing > 200) {
+            this.bot.swingArm('right');
+            this.bot.emit('botArmSwingStart', 'right');
+            this.bot.emit('botArmSwingEnd', 'right');
+            this.lastSwing = performance.now();
+        }
+    }
+    setConfigFromPacket(packet) {
+        if (packet.customBreakTime) {
+            this.customBreakTime = packet.customBreakTime;
+        }
+        if (packet.customBreakTimeToolAllowance) {
+            this.customBreakTimeToolAllowance = new Set(packet.customBreakTimeToolAllowance);
+        }
+        if (packet.noBreakPositiveUpdate !== undefined) {
+            this.settings.noBreakPositiveUpdate = packet.noBreakPositiveUpdate;
+        }
+        if (packet.blockPlacePrediction !== undefined) {
+            this.settings.blockPlacePrediction = packet.blockPlacePrediction;
+        }
+        if (packet.blockPlacePredictionDelay !== undefined) {
+            this.settings.blockPlacePredictionDelay = packet.blockPlacePredictionDelay;
+        }
+        if (packet.blockPlacePredictionCheckEntities !== undefined) {
+            this.settings.blockPlacePredictionCheckEntities = packet.blockPlacePredictionCheckEntities;
+        }
+        if (packet.preventVehicleInteraction !== undefined) {
+            this.settings.preventVehicleInteraction = packet.preventVehicleInteraction;
+        }
+        if (packet.allowInAirMining !== undefined) {
+            this.settings.allowInAirMining = packet.allowInAirMining;
+        }
+    }
+    startBreaking(block) {
+        // patch mineflayer
+        if (this.settings.noBreakPositiveUpdate && !this.bot['_updateBlockStateOld']) {
+            this.bot['_updateBlockStateOld'] = this.bot['_updateBlockState'];
+            this.bot['_updateBlockState'] = () => { };
+        }
+        else if (!this.settings.noBreakPositiveUpdate && this.bot['_updateBlockStateOld']) {
+            this.bot['_updateBlockState'] = this.bot['_updateBlockStateOld'];
+            delete this.bot['_updateBlockStateOld'];
+        }
+        this.lastDugBlock = null;
+        this.debugDigStatus = 'breaking';
+        this.currentDigTime = this.digTime(block);
+        this.breakStartTime = performance.now();
+        // Reset break state when starting new break
+        this.prevBreakState = null;
+        const vecArray = [new vec3_1.Vec3(0, -1, 0), new vec3_1.Vec3(0, 1, 0), new vec3_1.Vec3(0, 0, -1), new vec3_1.Vec3(0, 0, 1), new vec3_1.Vec3(-1, 0, 0), new vec3_1.Vec3(1, 0, 0)];
+        this.bot.dig(
+        //@ts-ignore
+        block, 'ignore', vecArray[block.face], block.face).catch((err) => {
+            if (err.message === 'Digging aborted')
+                return;
+            throw err;
+        });
+        this.bot.emit('startDigging', block);
+        this.bot.emit('botArmSwingStart', 'right');
+    }
+    updateButtonStates() {
+        this.lastButtons[0] = this.buttons[0];
+        this.lastButtons[1] = this.buttons[1];
+        this.lastButtons[2] = this.buttons[2];
+    }
+    getDataFromShape(shape) {
+        const width = shape[3] - shape[0];
+        const height = shape[4] - shape[1];
+        const depth = shape[5] - shape[2];
+        const centerX = (shape[3] + shape[0]) / 2;
+        const centerY = (shape[4] + shape[1]) / 2;
+        const centerZ = (shape[5] + shape[2]) / 2;
+        const position = new vec3_1.Vec3(centerX, centerY, centerZ);
+        return { position, width, height, depth };
+    }
+    getBlockCursorShapes(block) {
+        const shapes = [...block.shapes ?? [], ...block['interactionShapes'] ?? []];
+        if (!shapes.length)
+            return [];
+        return shapes;
+    }
+    getMergedCursorShape(block) {
+        const shapes = this.getBlockCursorShapes(block);
+        if (!shapes.length)
+            return undefined;
+        return shapes.reduce((acc, cur) => {
+            return [
+                Math.min(acc[0], cur[0]),
+                Math.min(acc[1], cur[1]),
+                Math.min(acc[2], cur[2]),
+                Math.max(acc[3], cur[3]),
+                Math.max(acc[4], cur[4]),
+                Math.max(acc[5], cur[5])
+            ];
+        });
+    }
+}
+exports.MouseManager = MouseManager;
+exports.MousePlugin = MouseManager;
+const versionToNumber = (ver) => {
+    const [x, y = '0', z = '0'] = ver.split('.');
+    return +`${x.padStart(2, '0')}${y.padStart(2, '0')}${z.padStart(2, '0')}`;
+};
+exports.versionToNumber = versionToNumber;
+const OLD_UNSUPPORTED_VERSIONS = (0, exports.versionToNumber)('1.16.5');
+let warningPrinted = false;
+function inject(bot, settings) {
+    if (settings.warnings !== false && !warningPrinted && (0, exports.versionToNumber)(bot.version) <= OLD_UNSUPPORTED_VERSIONS) {
+        console.warn(`[mineflayer-mouse] This version of Minecraft (${bot.version}) has known issues like doors interactions or item using. Please upgrade to a newer, better tested version for now.`);
+        warningPrinted = true;
+    }
+    const mouse = new MouseManager(bot, settings);
+    bot.mouse = mouse;
+    bot.rightClickStart = () => {
+        mouse.buttons[2] = true;
+        mouse.update();
+    };
+    bot.rightClickEnd = () => {
+        mouse.buttons[2] = false;
+        mouse.update();
+    };
+    bot.leftClickStart = () => {
+        mouse.buttons[0] = true;
+        mouse.update();
+    };
+    bot.leftClickEnd = () => {
+        mouse.buttons[0] = false;
+        mouse.update();
+    };
+    bot.leftClick = () => {
+        bot.leftClickStart();
+        bot.leftClickEnd();
+    };
+    bot.rightClick = () => {
+        bot.rightClickStart();
+        bot.rightClickEnd();
+    };
+    Object.defineProperty(bot, 'usingItem', {
+        get: () => mouse.itemBeingUsed
+    });
+    return mouse;
+}
+function vectorToDirection(v) {
+    if (v.y < 0) {
+        return 0;
+    }
+    else if (v.y > 0) {
+        return 1;
+    }
+    else if (v.z < 0) {
+        return 2;
+    }
+    else if (v.z > 0) {
+        return 3;
+    }
+    else if (v.x < 0) {
+        return 4;
+    }
+    else if (v.x > 0) {
+        return 5;
+    }
+    throw new Error(`invalid direction vector ${v}`);
+}
