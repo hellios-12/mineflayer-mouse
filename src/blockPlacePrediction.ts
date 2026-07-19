@@ -77,21 +77,32 @@ export const botTryPlaceBlockPrediction = (bot: Bot, cursorBlock: Block, faceNum
         }
 
         if (doWorldUpdate) {
-            const doUpdate = () => {
-                bot.world.setBlockStateId(placingPosition, finalBlock.stateId)
-            }
             if (doWorldUpdateDelay) {
-                let timeout = setTimeout(doUpdate, doWorldUpdateDelay)
-                bot.on('end', () => {
-                    clearTimeout(timeout)
-                })
-                bot.on('blockUpdate', (_, newBlock) => {
+                // eslint-disable-next-line prefer-const
+                let timeout: ReturnType<typeof setTimeout>
+                const cleanup = () => {
+                    bot.removeListener('blockUpdate', onBlockUpdate)
+                    bot.removeListener('end', onEnd)
+                }
+                const doUpdate = () => {
+                    bot.world.setBlockStateId(placingPosition, finalBlock.stateId)
+                    cleanup()
+                }
+                const onBlockUpdate = (_: any, newBlock: Block) => {
                     if (newBlock.position.equals(placingPosition)) {
                         clearTimeout(timeout)
+                        cleanup()
                     }
-                })
+                }
+                const onEnd = () => {
+                    clearTimeout(timeout)
+                    cleanup()
+                }
+                timeout = setTimeout(doUpdate, doWorldUpdateDelay)
+                bot.on('end', onEnd)
+                bot.on('blockUpdate', onBlockUpdate)
             } else {
-                doUpdate()
+                bot.world.setBlockStateId(placingPosition, finalBlock.stateId)
             }
         }
         return true
