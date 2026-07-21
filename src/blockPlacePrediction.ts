@@ -77,32 +77,55 @@ export const botTryPlaceBlockPrediction = (bot: Bot, cursorBlock: Block, faceNum
         }
 
         if (doWorldUpdate) {
+            const doUpdate = () => {
+                bot.world.setBlockStateId(placingPosition, finalBlock.stateId)
+            }
             if (doWorldUpdateDelay) {
-                // eslint-disable-next-line prefer-const
-                let timeout: ReturnType<typeof setTimeout>
-                const cleanup = () => {
-                    bot.removeListener('blockUpdate', onBlockUpdate)
-                    bot.removeListener('end', onEnd)
-                }
-                const doUpdate = () => {
-                    bot.world.setBlockStateId(placingPosition, finalBlock.stateId)
-                    cleanup()
-                }
-                const onBlockUpdate = (_: any, newBlock: Block) => {
+                let timeout = setTimeout(doUpdate, doWorldUpdateDelay)
+                bot.on('end', () => {
+                    clearTimeout(timeout)
+                })
+                bot.on('blockUpdate', (_, newBlock) => {
                     if (newBlock.position.equals(placingPosition)) {
                         clearTimeout(timeout)
+                    }
+                })
+            } else {
+                // Speculative placement applied immediately with no delay to cancel on.
+                // Still needs reconciliation: if the server never confirms this placement
+                // (denied by protection/plugin, out of reach, cooldown, etc.) the local
+                // world permanently diverges from the server's, which can desync anything
+                // that trusts local block data for correctness (e.g. the mesher's
+                // occlusion/cave-culling graph, which computes section visibility purely
+                // from local blocks and can end up treating an unconfirmed cell as open).
+                const previousStateId = oldBlock?.stateId
+                doUpdate()
+                let confirmed = false
+                let revertTimeout: ReturnType<typeof setTimeout>
+                const cleanup = () => {
+                    clearTimeout(revertTimeout)
+                    bot.removeListener('blockUpdate', onConfirm)
+                    bot.removeListener('end', cleanup)
+                }
+                const onConfirm = (_: unknown, newBlock: Block) => {
+                    if (newBlock.position.equals(placingPosition)) {
+                        confirmed = true
                         cleanup()
                     }
                 }
-                const onEnd = () => {
-                    clearTimeout(timeout)
+                revertTimeout = setTimeout(() => {
                     cleanup()
-                }
-                timeout = setTimeout(doUpdate, doWorldUpdateDelay)
-                bot.on('end', onEnd)
-                bot.on('blockUpdate', onBlockUpdate)
-            } else {
-                bot.world.setBlockStateId(placingPosition, finalBlock.stateId)
+                    if (confirmed) return
+                    // Server never confirmed this placement — revert to the pre-prediction
+                    // state so the local world (and the mesher fed by it) doesn't keep a
+                    // block that doesn't actually exist server-side.
+                    const currentBlock = bot.world.getBlock(placingPosition)
+                    if (currentBlock?.stateId === finalBlock.stateId) {
+                        bot.world.setBlockStateId(placingPosition, previousStateId ?? 0)
+                    }
+                }, 1000)
+                bot.on('blockUpdate', onConfirm)
+                bot.on('end', cleanup)
             }
         }
         return true
