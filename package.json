@@ -1,0 +1,48 @@
+{
+    "name": "mineflayer-mouse",
+    "version": "0.0.0-dev",
+    "license": "MIT",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "files": [
+        "dist"
+    ],
+    "scripts": {
+        "watch": "tsc --watch",
+        "build": "tsc",
+        "test": "vitest"
+    },
+    "keywords": [
+        "mineflayer",
+        "mouse",
+        "digging",
+        "mining",
+        "automation",
+        "minecraft",
+        "botting",
+        "placing",
+        "breaking",
+        "player",
+        "blocks",
+        "miner",
+        "actually works"
+    ],
+    "packageManager": "pnpm@10.2.0",
+    "devDependencies": {
+        "@types/node": "^22.13.10",
+        "@zardoy/tsconfig": "^1.5.1",
+        "minecraft-data": "^3.95.1",
+        "mineflayer": "^4.26.0",
+        "prismarine-block": "^1.21.0",
+        "prismarine-entity": "^2.5.0",
+        "typescript": "^5.7.3",
+        "vec3": "^0.1.10",
+        "vitest": "^3.0.6"
+    },
+    "dependencies": {
+        "change-case": "^5.4.4",
+        "debug": "^4.4.0",
+        "prismarine-item": "^1.16.0",
+        "prismarine-world": "^3.6.3"
+    }
+}
